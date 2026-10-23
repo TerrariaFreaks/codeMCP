@@ -5,7 +5,7 @@ const IGNORED_DIRS = new Set([
   "node_modules", ".git", "dist", "build", ".next", "coverage", ".turbo", ".cache",
 ]);
 const IGNORED_FILES = new Set(["package-lock.json", "yarn.lock", "pnpm-lock.yaml"]);
-const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+export const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
 
 export async function walkProject(root: string): Promise<string[]> {
   const results: string[] = [];
