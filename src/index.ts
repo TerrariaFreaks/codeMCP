@@ -7,6 +7,7 @@ import path from "node:path";
 import { walkProject, CODE_EXTENSIONS } from "./walk.js";
 import { extractSymbols } from "./parse.js";
 import { SymbolIndex } from "./symbol-index.js";
+import { readProjectFile, formatRead } from "./read.js";
 
 // 1. Read the project folder from the command line
 const rawRoot = process.argv[2];
@@ -32,6 +33,7 @@ const asError = (message: string) => ({
   isError: true,
   content: [{ type: "text" as const, text: message }],
 });
+const asPlain = (text: string) => ({ content: [{ type: "text" as const, text }] });
 
 // 2. Keep hello for testing
 server.registerTool(
@@ -273,6 +275,79 @@ server.registerTool(
         "'name-match' callers are guesses based on the method name alone.",
       ],
     });
+  }
+);
+
+// 10. Read source code
+server.registerTool(
+  "read_file",
+  {
+    description:
+      "Reads the source of a file in the project, with line numbers. Optionally pass startLine and endLine to read just a range. At most 400 lines are returned per call, and the response says how to continue. Works for any text file (code, package.json, config files, README). Files that commonly hold secrets (.env, keys, credentials) are blocked. Prefer get_file_outline or read_symbol first, so you read only what you need.",
+    inputSchema: {
+      path: z.string().min(1).describe("File path relative to the project root, e.g. server/index.js"),
+      startLine: z.number().int().min(1).optional().describe("First line to read (1-based). Default: 1"),
+      endLine: z.number().int().min(1).optional().describe("Last line to read. Default: end of file, up to 400 lines"),
+    },
+  },
+  async ({ path: relPath, startLine, endLine }) => {
+    const r = await readProjectFile(projectRoot, relPath, startLine, endLine);
+    return r.ok ? asPlain(formatRead(r)) : asError(r.message);
+  }
+);
+
+// 11. Read one symbol
+server.registerTool(
+  "read_symbol",
+  {
+    description:
+      "Returns the source code of a function, class, method, interface, type or enum by exact name, with line numbers. For a method use Class.method (for example OrderService.place). If several files define the same name, all matches are shown (up to 4); pass file to pick one. Use this after search_symbols or find_callers to see what the code actually does.",
+    inputSchema: {
+      name: z.string().min(1).describe("Exact symbol name, or Class.method for a method"),
+      file: z.string().optional().describe("Only the definition in this file (relative path)"),
+      contextLines: z.number().int().min(0).max(10).default(2)
+        .describe("Extra lines to include above the definition, to catch comments"),
+    },
+  },
+  async ({ name, file, contextLines }) => {
+    await index.ensureFresh();
+    const g = index.graph();
+    let fileArg: string | undefined;
+    if (file) {
+      const r = g.resolveFileArg(file);
+      if (!r.ok) return asError(r.message);
+      fileArg = r.file;
+    }
+    let symbolName = name;
+    let parentName: string | undefined;
+    const dot = name.lastIndexOf(".");
+    if (dot > 0) {
+      parentName = name.slice(0, dot);
+      symbolName = name.slice(dot + 1);
+    }
+    const defs = g
+      .definitionsOf(symbolName, fileArg)
+      .filter((d) => !parentName || d.parent === parentName)
+      .sort((a, b) => a.file.localeCompare(b.file) || a.startLine - b.startLine);
+    if (defs.length === 0) {
+      return asError(
+        `No definition named "${name}"${fileArg ? ` in ${fileArg}` : ""} found. Names are exact and case-sensitive; try search_symbols.`
+      );
+    }
+
+    const MAX_SHOWN = 4;
+    const sections: string[] = [];
+    for (const d of defs.slice(0, MAX_SHOWN)) {
+      const from = Math.max(1, d.startLine - contextLines);
+      const r = await readProjectFile(projectRoot, d.file, from, d.endLine);
+      const label = `${d.parent ? d.parent + "." : ""}${d.name} (${d.kind}) in ${d.file}, lines ${d.startLine}-${d.endLine}`;
+      sections.push(r.ok ? `## ${label}\n${formatRead(r)}` : `## ${label}\n(could not read: ${r.message})`);
+    }
+    if (defs.length > MAX_SHOWN) {
+      const rest = defs.slice(MAX_SHOWN).map((d) => `${d.file}:${d.startLine}`).join(", ");
+      sections.push(`${defs.length - MAX_SHOWN} more definition(s) not shown: ${rest}. Pass file to read a specific one.`);
+    }
+    return asPlain(sections.join("\n\n"));
   }
 );
 
