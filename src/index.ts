@@ -52,7 +52,7 @@ server.registerTool(
   "list_project_files",
   {
     description:
-      "Lists the JavaScript/TypeScript source files in the project, with junk like node_modules and build output excluded. Use this first to see how a project is laid out.",
+      "Lists the JavaScript, TypeScript and Python source files in the project, with junk like node_modules, venv and build output excluded. Use this first to see how a project is laid out.",
     inputSchema: {
       limit: z.number().int().min(1).max(1000).default(200)
         .describe("Maximum number of file paths to return"),

@@ -54,7 +54,32 @@ interface ResolvedCall extends CallerHit {
 }
 
 const EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
-const TEST_RE = /(\.(test|spec)\.[cm]?[jt]sx?$)|(^|\/)__tests__\//;
+const TEST_RE =
+  /(\.(test|spec)\.[cm]?[jt]sx?$)|(^|\/)__tests__\/|(^|\/)test_[^/]*\.py$|_test\.py$|(^|\/)tests?\/|(^|\/)conftest\.py$/;
+
+// Python standard-library modules (from sys.stdlib_module_names): not listed as "packages used"
+const PY_STDLIB = new Set(
+  (
+    "__future__ abc aifc antigravity argparse array ast asyncio atexit audioop base64 bdb binascii " +
+    "bisect builtins bz2 cProfile calendar cgi cgitb chunk cmath cmd code codecs codeop collections " +
+    "colorsys compileall concurrent configparser contextlib contextvars copy copyreg crypt csv " +
+    "ctypes curses dataclasses datetime dbm decimal difflib dis doctest email encodings ensurepip " +
+    "enum errno faulthandler fcntl filecmp fileinput fnmatch fractions ftplib functools gc " +
+    "genericpath getopt getpass gettext glob graphlib grp gzip hashlib heapq hmac html http idlelib " +
+    "imaplib imghdr importlib inspect io ipaddress itertools json keyword lib2to3 linecache locale " +
+    "logging lzma mailbox mailcap marshal math mimetypes mmap modulefinder msilib msvcrt " +
+    "multiprocessing netrc nis nntplib nt ntpath nturl2path numbers opcode operator optparse os " +
+    "ossaudiodev pathlib pdb pickle pickletools pipes pkgutil platform plistlib poplib posix " +
+    "posixpath pprint profile pstats pty pwd py_compile pyclbr pydoc pydoc_data pyexpat queue quopri " +
+    "random re readline reprlib resource rlcompleter runpy sched secrets select selectors shelve " +
+    "shlex shutil signal site smtplib sndhdr socket socketserver spwd sqlite3 sre_compile " +
+    "sre_constants sre_parse ssl stat statistics string stringprep struct subprocess sunau symtable " +
+    "sys sysconfig syslog tabnanny tarfile telnetlib tempfile termios textwrap this threading time " +
+    "timeit tkinter token tokenize tomllib trace traceback tracemalloc tty turtle turtledemo types " +
+    "typing unicodedata unittest urllib uu uuid venv warnings wave weakref webbrowser winreg " +
+    "winsound wsgiref xdrlib xml xmlrpc zipapp zipfile zipimport zlib zoneinfo"
+  ).split(" ")
+);
 
 export const isTestFile = (f: string) => TEST_RE.test(f);
 
@@ -86,24 +111,53 @@ export class CodeGraph {
       (this.symbolsByName.get(s.name) ?? this.symbolsByName.set(s.name, []).get(s.name)!).push(s);
     }
 
+    // Re-exports first: needed to decide whether an imported name is a symbol or a submodule
+    for (const imp of rows.imports) {
+      if (imp.kind === "reexport") {
+        (this.reexports.get(imp.file) ?? this.reexports.set(imp.file, []).get(imp.file)!).push(imp);
+      }
+    }
+
+    const addEdge = (from: string, to: string) => {
+      if (from === to) return; // e.g. `from . import x` inside a package's own __init__.py
+      this.forward.get(from)!.add(to);
+      this.reverse.get(to)!.add(from);
+    };
+
     for (const imp of rows.imports) {
       const res = this.resolveSpecifier(imp.file, imp.specifier);
       if (res.type === "internal") {
-        this.forward.get(imp.file)!.add(res.file);
-        this.reverse.get(res.file)!.add(imp.file);
+        addEdge(imp.file, res.file);
       } else if (res.type === "external") {
         (this.externalUse.get(res.pkg) ?? this.externalUse.set(res.pkg, new Set()).get(res.pkg)!).add(imp.file);
       }
-      if (imp.kind === "reexport") {
-        (this.reexports.get(imp.file) ?? this.reexports.set(imp.file, []).get(imp.file)!).push(imp);
-      } else if (imp.localName) {
-        let m = this.localImports.get(imp.file);
-        if (!m) { m = new Map(); this.localImports.set(imp.file, m); }
-        m.set(imp.localName, {
-          resolved: res.type === "internal" ? res.file : null,
-          imported: imp.importedName ?? "*",
-        });
+      if (imp.kind === "reexport" || !imp.localName) continue;
+
+      let resolved: string | null = res.type === "internal" ? res.file : null;
+      let imported = imp.importedName ?? "*";
+
+      // Python: "from pkg import name" imports a submodule (pkg/name.py) when pkg doesn't define `name`
+      if (imp.file.endsWith(".py") && imp.kind === "import" && imp.importedName && imp.importedName !== "*") {
+        const definedHere =
+          res.type === "internal" &&
+          (this.hasSymbol(res.file, imp.importedName) ||
+            (this.reexports.get(res.file) ?? []).some((r) => r.localName === imp.importedName));
+        if (!definedHere) {
+          const subSpec = /^\.+$/.test(imp.specifier)
+            ? imp.specifier + imp.importedName
+            : `${imp.specifier}.${imp.importedName}`;
+          const sub = this.resolveSpecifier(imp.file, subSpec);
+          if (sub.type === "internal") {
+            resolved = sub.file;
+            imported = "*";
+            addEdge(imp.file, sub.file);
+          }
+        }
       }
+
+      let m = this.localImports.get(imp.file);
+      if (!m) { m = new Map(); this.localImports.set(imp.file, m); }
+      m.set(imp.localName, { resolved, imported });
     }
 
     for (const c of rows.calls) {
@@ -129,7 +183,9 @@ export class CodeGraph {
     const cached = this.resolveCache.get(key);
     if (cached) return cached;
     let result: Resolution;
-    if (!spec.startsWith(".")) {
+    if (from.endsWith(".py")) {
+      result = this.resolvePython(from, spec);
+    } else if (!spec.startsWith(".")) {
       result = { type: "external", pkg: packageName(spec) };
     } else {
       const base = path.posix.normalize(path.posix.join(path.posix.dirname(from), spec));
@@ -148,11 +204,48 @@ export class CodeGraph {
     return result;
   }
 
+  /** Python: '.', '..pkg.mod' (relative) or 'pkg.mod' (absolute) to a project file. */
+  private resolvePython(from: string, spec: string): Resolution {
+    const m = spec.match(/^(\.*)(.*)$/)!;
+    const dots = m[1].length;
+    const modPath = m[2] ? m[2].split(".").join("/") : "";
+    const join = (dir: string, rel: string) => (dir && dir !== "." ? (rel ? `${dir}/${rel}` : dir) : rel);
+    const tryIn = (dir: string): string | null => {
+      const base = join(dir, modPath);
+      const candidates = modPath
+        ? [`${base}.py`, `${base}/__init__.py`]
+        : [base ? `${base}/__init__.py` : "__init__.py"];
+      return candidates.find((c) => this.fileSet.has(c)) ?? null;
+    };
+
+    if (dots > 0) {
+      let dir = path.posix.dirname(from);
+      for (let i = 1; i < dots; i++) dir = path.posix.dirname(dir);
+      const found = tryIn(dir === "." ? "" : dir);
+      return found ? { type: "internal", file: found } : { type: "unresolved" };
+    }
+
+    // Absolute import: try from the importing file's folder up to the project root, then src/
+    let dir = path.posix.dirname(from);
+    for (;;) {
+      const found = tryIn(dir === "." ? "" : dir);
+      if (found) return { type: "internal", file: found };
+      if (dir === "." || dir === "" || dir === "/") break;
+      dir = path.posix.dirname(dir);
+    }
+    const inSrc = tryIn("src");
+    if (inSrc) return { type: "internal", file: inSrc };
+
+    const top = m[2].split(".")[0];
+    if (!top || top.startsWith("_") || PY_STDLIB.has(top)) return { type: "unresolved" };
+    return { type: "external", pkg: top };
+  }
+
   private hasSymbol(file: string, name: string): boolean {
     return (this.symbolsByFile.get(file) ?? []).some((s) => s.name === name);
   }
 
-  /** Follow `export { x } from './y'` chains (barrel files) to the real definition. */
+  /** Follow `export { x } from './y'` (and Python `from .y import x`) chains to the real definition. */
   private followReexport(file: string, name: string, depth = 0): { file: string; name: string } {
     if (depth > 5 || this.hasSymbol(file, name)) return { file, name };
     for (const r of this.reexports.get(file) ?? []) {
@@ -175,12 +268,12 @@ export class CodeGraph {
 
   private resolveCall(c: CallRow): { file: string | null; name: string; confidence: "resolved" | "name-match" } | null {
     const imports = this.localImports.get(c.file);
-    const isRef = c.kind === "ref";
+    const isRef = c.kind === "ref" || c.kind === "extends";
 
     if (c.object === null) {
       const imp = imports?.get(c.callee);
       if (imp) {
-        if (!imp.resolved) return null; // function from an npm package
+        if (!imp.resolved) return null; // function from an npm / pip package
         const t = this.resolveImportedName(imp.resolved, imp.imported, c.callee);
         return { file: t.file, name: t.name, confidence: "resolved" };
       }
@@ -199,7 +292,7 @@ export class CodeGraph {
 
     const imp = imports?.get(c.object);
     if (imp) {
-      if (!imp.resolved) return null; // axios.get(), express.Router() ...
+      if (!imp.resolved) return null; // axios.get(), express.Router(), os.path.join() ...
       const t = this.followReexport(imp.resolved, c.callee);
       return { file: t.file, name: t.name, confidence: "resolved" };
     }
